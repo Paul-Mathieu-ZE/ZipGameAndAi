@@ -20,17 +20,20 @@ class Board:
     def generate_maze(self):
         r, c = self.sizeX, self.sizeY
         maze = np.ones((r, c), dtype=int)
+
         def carve(x, y):
             maze[x, y] = 0
-            dirs = [(0,2),(2,0),(-2,0),(0,-2)]
-            random.shuffle(dirs)
-            for dx, dy in dirs:
-                nx, ny = x+dx, y+dy
-                if 1 <= nx < r-1 and 1 <= ny < c-1 and maze[nx, ny] == 1:
-                    maze[x+dx//2, y+dy//2] = 0
+            directions = [(0, 2), (2, 0), (-2, 0), (0, -2)]
+            random.shuffle(directions)
+            for dx, dy in directions:
+                nx, ny = x + dx, y + dy
+                if 1 <= nx < r - 1 and 1 <= ny < c - 1 and maze[nx, ny] == 1:
+                    maze[x + dx // 2, y + dy // 2] = 0
                     carve(nx, ny)
-        carve(1,1)
+
+        carve(1, 1)
         return self._add_start_and_goal(maze)
+
 
     def _add_start_and_goal(self, board):
         r, c = board.shape
@@ -48,6 +51,7 @@ class Board:
             self.goal_pos = g
         return board
 
+
     def _save_board(self):
         path = os.path.join(Board._boards_dir, f"board_{self.index}.npy")
         np.save(path, self.board)
@@ -55,9 +59,20 @@ class Board:
     @classmethod
     def load_board(cls, index):
         path = os.path.join(cls._boards_dir, f"board_{index}.npy")
-        if not os.path.exists(path): return None
-        b = cls(board_data=np.load(path)); b.index = index
+        if not os.path.exists(path):
+            return None
+        board_data = np.load(path)
+        b = cls(board_data=board_data)
+        b.index = index
+
+        # Restore start and goal positions
+        start = np.argwhere(board_data == 2)
+        goal = np.argwhere(board_data == 3)
+        b.start_pos = tuple(start[0]) if len(start) > 0 else None
+        b.goal_pos = tuple(goal[0]) if len(goal) > 0 else None
+
         return b
+
 
     @classmethod
     def list_boards(cls):
@@ -76,7 +91,3 @@ def board_generator(sizeX, sizeY, number):
         b.index = Board._counter; Board._counter += 1
         b._save_board(); yield b
 
-if __name__ == "__main__":
-    for b in board_generator(15, 15, 3):
-        b.display()
-    Board.load_board(0).display()
