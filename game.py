@@ -9,7 +9,10 @@ import time
 
 CELL_SIZE = 20
 
+
 class MazeEnv:
+    META_DIM = 8
+
     def __init__(self, width, height):
         self.width, self.height = width, height
         self.actions = [(-1, 0), (1, 0), (0, -1), (0, 1)]
@@ -69,12 +72,14 @@ class MazeEnv:
         self.white_distance = self.compute_white_distance()
         current = self.white_distance if self.white_distance is not None else (self.width * self.height)
         progress = previous - current
-        # shaped reward encourages moving closer to goal, mild penalty for wandering
-        reward = -0.02 + 0.1 * np.clip(progress, -1.0, 1.0)
+        if progress < 0:
+            reward = -0.02 * abs(progress)
+        else:
+            reward = 0.3*abs(progress)
         self.last_distance = current
         done = self.agent_pos == self.goal
         if done:
-            reward = 5.0
+            reward = 10.0
         return self._get_state(), reward, done
 
     def compute_white_distance(self):
@@ -124,17 +129,25 @@ class MazeEnv:
             prev_dy
         ], dtype=np.float32)
 
-        wall_map = (self.board == 1).astype(np.float32).ravel()
+        wall_map = (self.board == 1).astype(np.float32)
         agent_map = np.zeros_like(self.board, dtype=np.float32)
         agent_map[ax, ay] = 1.0
         goal_map = np.zeros_like(self.board, dtype=np.float32)
         goal_map[gx, gy] = 1.0
-        return np.concatenate([meta, wall_map, agent_map.ravel(), goal_map.ravel()]).astype(np.float32)
+        stacked = np.stack([wall_map, agent_map, goal_map], axis=0).astype(np.float32)
+        return np.concatenate([meta, stacked.ravel()]).astype(np.float32)
 
     @property
     def state_dim(self):
-        # meta (8 values) + three flattened maps (wall/agent/goal)
-        return int(8 + 3 * self.width * self.height)
+        return int(self.meta_dim + np.prod(self.grid_shape))
+
+    @property
+    def meta_dim(self):
+        return self.META_DIM
+
+    @property
+    def grid_shape(self):
+        return (3, int(self.height), int(self.width))
 
     def get_valid_actions(self):
         valids = []
@@ -179,8 +192,14 @@ class MazeGame:
         self.width = 20
         self.height = 20
         self.env = MazeEnv(self.width, self.height)
-        self.agent = DQNAgent(state_dim=self.env.state_dim, action_dim=len(self.env.actions))
+        self.agent = DQNAgent(
+            state_dim=self.env.state_dim,
+            action_dim=len(self.env.actions),
+            grid_shape=self.env.grid_shape,
+            meta_dim=self.env.meta_dim
+        )
         self.agent.load()
+
 
         self.training_stats = {"mazes": 0, "solved": 0, "episodes": 0}
         self.training_thread = None
@@ -297,11 +316,22 @@ class MazeGame:
         center_y = offset_y + ax * CELL_SIZE + CELL_SIZE // 2
         pygame.draw.circle(self.screen, (50, 120, 255), (center_x, center_y), CELL_SIZE // 3)
 
+    def _create_env(self):
+        while True:
+            env = MazeEnv(self.width, self.height)
+            if env.start and env.goal and env.start != env.goal:
+                return env
+
     def generate_maze(self):
-        self.env = MazeEnv(self.width, self.height)
+        self.env = self._create_env()
         required_state_dim = self.env.state_dim
         if (self.agent is None) or (self.agent.state_dim != required_state_dim):
-            self.agent = DQNAgent(state_dim=required_state_dim, action_dim=len(self.env.actions))
+            self.agent = DQNAgent(
+                state_dim=required_state_dim,
+                action_dim=len(self.env.actions),
+                grid_shape=self.env.grid_shape,
+                meta_dim=self.env.meta_dim
+            )
             self.agent.load()
         else:
             self.agent.boost_exploration()
@@ -314,94 +344,130 @@ class MazeGame:
         self.training_thread = Thread(target=self.train_on_multiple_mazes, daemon=True)
         self.training_thread.start()
         self.set_status("Training started (background).")
-
+    
     def train_on_multiple_mazes(self, mazes=100, episodes_per_maze=100):
+        parallel_envs = max(2, min(8, (self.width * self.height) // 50))
         for maze_index in range(mazes):
             if self.stop_event.is_set():
                 return
-            while True:
-                self.env = MazeEnv(self.width, self.height)
-                if self.env.start and self.env.goal and self.env.start != self.env.goal:
-                    break
+            envs = [self._create_env() for _ in range(parallel_envs)]
+            states = [env._get_state() for env in envs]
+            self.env = envs[0]
 
             self.training_stats["mazes"] += 1
             required_state_dim = self.env.state_dim
             if (self.agent is None) or (self.agent.state_dim != required_state_dim):
-                self.agent = DQNAgent(state_dim=required_state_dim, action_dim=len(self.env.actions))
+                self.agent = DQNAgent(
+                    state_dim=required_state_dim,
+                    action_dim=len(self.env.actions),
+                    grid_shape=self.env.grid_shape,
+                    meta_dim=self.env.meta_dim
+                )
                 self.agent.load()
             else:
                 self.agent.boost_exploration()
 
-            self.env.agent_pos = self.env.start
-            self.set_status(f"Maze {maze_index+1}/{mazes} generated. Training...")
+            self.set_status(f"Maze {maze_index+1}/{mazes} generated | Parallel envs: {parallel_envs}")
 
             maze_solved_any = False
-            solved_streak = 0
+            per_env_streaks = [0] * parallel_envs
+            per_env_rewards = [0.0] * parallel_envs
+            per_env_lengths = [0] * parallel_envs
             episode_rewards = []
             best_reward = -float("inf")
             stagnation_counter = 0
-            stagnation_patience = 15
+            stagnation_patience = 25
             exit_reason = ""
+            warmup_episodes = 3
+            episodes_completed = 0
+            max_steps = max(int(self.width * self.height * 1.5), self.width + self.height)
 
-            for ep in range(episodes_per_maze):
+            while episodes_completed < episodes_per_maze:
                 if self.stop_event.is_set():
                     return
-                self.env.reset()
-                state = self.env._get_state()
-                total_reward = 0.0
-                estimated = self.env.white_distance if self.env.white_distance is not None else (self.env.width * self.env.height)
-                max_steps = max(int(estimated * 3), self.env.width * self.env.height // 2, self.env.width + self.env.height)
-                solved_this_episode = False
-                for step in range(max_steps):
-                    if self.stop_event.is_set():
-                        return
-                    valid_actions = self.env.get_valid_actions()
-                    action = self.agent.act(state, valid_actions=valid_actions)
-                    next_state, reward, done = self.env.step(action)
-                    self.agent.remember(state, action, reward, next_state, done)
-                    self.agent.train()
-                    state = next_state
-                    total_reward += reward
-                    if done:
-                        solved_this_episode = True
-                        break
-                    time.sleep(0.005)
 
-                episode_rewards.append(total_reward)
-                self.training_stats["episodes"] += 1
+                actions = []
+                valid_masks = []
+                for idx, env in enumerate(envs):
+                    if per_env_lengths[idx] == 0 and episodes_completed < warmup_episodes:
+                        self.agent.boost_exploration(0.5)
+                    valid = env.get_valid_actions()
+                    valid_masks.append(valid)
+                    actions.append(self.agent.act(states[idx], valid_actions=valid))
+
+                batch_transitions = []
+                episodes_finished_this_iter = 0
+                break_loop = False
+
+                for idx, env in enumerate(envs):
+                    curr_state = states[idx]
+                    next_state, reward, done = env.step(actions[idx])
+                    per_env_lengths[idx] += 1
+                    per_env_rewards[idx] += reward
+                    timeout = False
+                    if per_env_lengths[idx] >= max_steps and not done:
+                        done = True
+                        timeout = True
+
+                    batch_transitions.append((curr_state, actions[idx], reward, next_state, done))
+
+                    if done:
+                        episodes_completed += 1
+                        episodes_finished_this_iter += 1
+                        episode_total = per_env_rewards[idx]
+                        episode_rewards.append(episode_total)
+
+                        if not timeout and episode_total > 0:
+                            per_env_streaks[idx] += 1
+                            if not maze_solved_any:
+                                maze_solved_any = True
+                                self.training_stats["solved"] += 1
+                        else:
+                            per_env_streaks[idx] = 0
+
+                        if per_env_streaks[idx] >= 5:
+                            exit_reason = f"Env {idx+1} solved 5 in a row"
+                            break_loop = True
+
+                        if episode_total > best_reward + 0.1:
+                            best_reward = episode_total
+                            stagnation_counter = 0
+                        else:
+                            stagnation_counter += 1
+
+                        env.reset(regenerate=False)
+                        states[idx] = env._get_state()
+                        per_env_rewards[idx] = 0.0
+                        per_env_lengths[idx] = 0
+                    else:
+                        states[idx] = next_state
+
+                for transition in batch_transitions:
+                    self.agent.remember(*transition)
+
+                self.training_stats["episodes"] += episodes_finished_this_iter
+                self.agent.train()
                 self.agent.update_target()
 
                 success_rate = self.training_stats["solved"] / max(1, self.training_stats["mazes"])
-                rolling_reward = float(np.mean(episode_rewards[-5:])) if episode_rewards else 0.0
+                rolling_reward = float(np.mean(episode_rewards[-parallel_envs:])) if episode_rewards else 0.0
                 self.set_status(
-                    f"Maze {maze_index+1}/{mazes} | Ep {ep+1}/{episodes_per_maze} | Reward {total_reward:.2f} | Avg5 {rolling_reward:.2f} | SR {success_rate:.2f}"
+                    f"Maze {maze_index+1}/{mazes} | Episodes {episodes_completed}/{episodes_per_maze} | Avg {rolling_reward:.2f} | SR {success_rate:.2f}"
                 )
 
-                if solved_this_episode:
-                    solved_streak += 1
-                    if not maze_solved_any:
-                        maze_solved_any = True
-                        self.training_stats["solved"] += 1
-                    if solved_streak >= 5:
-                        exit_reason = "5 consecutive solves"
-                        break
-                else:
-                    solved_streak = 0
+                if break_loop:
+                    break
 
-                if total_reward > best_reward + 0.1:
-                    best_reward = total_reward
-                    stagnation_counter = 0
-                else:
-                    stagnation_counter += 1
-                    if stagnation_counter >= stagnation_patience:
-                        exit_reason = f"plateau ({stagnation_patience} eps without gain)"
-                        break
+                if stagnation_counter >= stagnation_patience:
+                    exit_reason = f"plateau ({stagnation_patience} eps without gain)"
+                    break
 
             average_reward = float(np.mean(episode_rewards)) if episode_rewards else 0.0
             result = "solved" if maze_solved_any else "unsolved"
             if not exit_reason:
                 exit_reason = "max episodes reached"
-            summary_text = f"Maze {maze_index+1}/{mazes} {result} | avg reward {average_reward:.2f} | streak {solved_streak} | {exit_reason}"
+            max_streak = max(per_env_streaks) if per_env_streaks else 0
+            summary_text = f"Maze {maze_index+1}/{mazes} {result} | avg reward {average_reward:.2f} | streak {max_streak} | {exit_reason}"
             print(f"[INFO] {summary_text}")
             self.set_status(summary_text)
             self.agent.save()
