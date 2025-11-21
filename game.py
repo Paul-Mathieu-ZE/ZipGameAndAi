@@ -1,6 +1,5 @@
 from board_gen import *
-import tkinter as tk
-from tkinter import ttk
+import pygame
 import numpy as np
 from board_gen import Board
 from dqn_agent import DQNAgent
@@ -163,189 +162,196 @@ class MazeEnv:
 
 
 
-class MazeApp:
-    def __init__(self, root):
-        self.root = root
-        # helper to schedule UI updates on the Tk main thread from worker threads
-        self._ui = lambda fn, *a, **kw: self.root.after(0, lambda: fn(*a, **kw))
-        # ensure commonly used attributes exist (won't override if already set later)
-        if not hasattr(self, "canvas"):
-            self.canvas = tk.Canvas(self.root)
-        if not hasattr(self, "stats"):
-            self.stats = ttk.Label(self.root, text="")
-        if not hasattr(self, "agent"):
-            self.agent = None
-        if not hasattr(self, "env"):
-            self.env = None
-        # graceful shutdown support for training thread
-        self.stop_event = threading.Event()
-        self.training_thread = None
+class MazeGame:
+    PANEL_HEIGHT = 120
+    BG_COLOR = (18, 18, 22)
+    GRID_COLOR = (200, 200, 200)
+
+    def __init__(self):
+        pygame.init()
+        self.window_width = 900
+        self.window_height = 900
+        self.screen = pygame.display.set_mode((self.window_width, self.window_height))
+        pygame.display.set_caption("Maze AI Trainer (Pygame)")
+        self.font = pygame.font.SysFont("consolas", 18)
+        self.clock = pygame.time.Clock()
+
+        self.width = 20
+        self.height = 20
+        self.env = MazeEnv(self.width, self.height)
+        self.agent = DQNAgent(state_dim=self.env.state_dim, action_dim=len(self.env.actions))
+        self.agent.load()
+
         self.training_stats = {"mazes": 0, "solved": 0, "episodes": 0}
-        # ensure window close goes through our handler so background threads stop
+        self.training_thread = None
+        self.stop_event = threading.Event()
+        self.running = True
+
+        self.status_lock = threading.Lock()
+        self.status_message = "G: generate | T: train | Arrows: resize | ESC: quit"
+
+    def set_status(self, text):
+        with self.status_lock:
+            self.status_message = text
+
+    def get_status(self):
+        with self.status_lock:
+            return self.status_message
+
+    def run(self):
         try:
-            self.root.protocol("WM_DELETE_WINDOW", self.on_close)
-        except Exception:
-            pass
+            while self.running:
+                self.handle_events()
+                self.draw()
+                pygame.display.flip()
+                self.clock.tick(60)
+        finally:
+            self.shutdown()
 
-        self.root.title("Maze AI Trainer")
-        self.canvas = tk.Canvas(root, width=600, height=600, bg="white")
-        self.canvas.pack()
-        self.stats = ttk.Label(root, text="Stats:"); self.stats.pack()
-        self.setup_controls()
+    def shutdown(self):
+        self.stop_event.set()
+        if self.training_thread and self.training_thread.is_alive():
+            self.training_thread.join(timeout=1.0)
+        pygame.quit()
 
-    def setup_controls(self):
-        frame = ttk.Frame(self.root); frame.pack(pady=10)
-        self.width_entry = ttk.Entry(frame, width=5); self.width_entry.insert(0, "20")
-        self.height_entry = ttk.Entry(frame, width=5); self.height_entry.insert(0, "20")
-        ttk.Label(frame, text="Width:").grid(row=0, column=0); self.width_entry.grid(row=0, column=1)
-        ttk.Label(frame, text="Height:").grid(row=0, column=2); self.height_entry.grid(row=0, column=3)
-        ttk.Button(frame, text="Generate", command=self.generate_maze).grid(row=0, column=4)
-        ttk.Button(frame, text="Train", command=self.start_training_thread).grid(row=0, column=5)
-        ttk.Button(frame, text="Show Path", command=self.show_path).grid(row=0, column=6)
+    def handle_events(self):
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                self.running = False
+            elif event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    self.running = False
+                elif event.key == pygame.K_g:
+                    self.generate_maze()
+                elif event.key == pygame.K_t:
+                    self.start_training_thread()
+                elif event.key == pygame.K_UP:
+                    self.adjust_height(1)
+                elif event.key == pygame.K_DOWN:
+                    self.adjust_height(-1)
+                elif event.key == pygame.K_RIGHT:
+                    self.adjust_width(1)
+                elif event.key == pygame.K_LEFT:
+                    self.adjust_width(-1)
+
+    def adjust_width(self, delta):
+        new_width = int(np.clip(self.width + delta, 5, 40))
+        if new_width != self.width:
+            self.width = new_width
+            self.set_status(f"Width set to {self.width}. Press G to regenerate maze.")
+
+    def adjust_height(self, delta):
+        new_height = int(np.clip(self.height + delta, 5, 40))
+        if new_height != self.height:
+            self.height = new_height
+            self.set_status(f"Height set to {self.height}. Press G to regenerate maze.")
+
+    def draw(self):
+        self.screen.fill(self.BG_COLOR)
+        self.draw_panel()
+        self.draw_maze()
+        self.draw_agent()
+
+    def draw_panel(self):
+        pygame.draw.rect(self.screen, (25, 25, 30), (0, 0, self.window_width, 80))
+        lines = [
+            f"Size: {self.width}x{self.height}  Cells: {self.width * self.height}",
+            f"Epsilon: {self.agent.epsilon:.3f} | Episodes: {self.training_stats['episodes']} | Mazes: {self.training_stats['mazes']} | Solved: {self.training_stats['solved']}",
+            self.get_status()
+        ]
+        for idx, line in enumerate(lines):
+            text = self.font.render(line, True, (230, 230, 230))
+            self.screen.blit(text, (20, 10 + idx * 22))
+
+    def draw_maze(self):
+        if not self.env or self.env.board is None:
+            return
+        rows, cols = self.env.height, self.env.width
+        maze_width = cols * CELL_SIZE
+        maze_height = rows * CELL_SIZE
+        offset_x = max((self.window_width - maze_width) // 2, 20)
+        offset_y = 100
+
+        colors = {
+            0: (240, 240, 240),
+            1: (20, 20, 20),
+            2: (0, 160, 90),
+            3: (200, 40, 40)
+        }
+        for i in range(rows):
+            for j in range(cols):
+                cell = int(self.env.board[i, j])
+                rect = pygame.Rect(offset_x + j * CELL_SIZE, offset_y + i * CELL_SIZE, CELL_SIZE, CELL_SIZE)
+                pygame.draw.rect(self.screen, colors.get(cell, (240, 240, 240)), rect)
+                pygame.draw.rect(self.screen, self.GRID_COLOR, rect, 1)
+
+    def draw_agent(self):
+        if not self.env:
+            return
+        rows, cols = self.env.height, self.env.width
+        maze_width = cols * CELL_SIZE
+        offset_x = max((self.window_width - maze_width) // 2, 20)
+        offset_y = 100
+        ax, ay = self.env.agent_pos
+        center_x = offset_x + ay * CELL_SIZE + CELL_SIZE // 2
+        center_y = offset_y + ax * CELL_SIZE + CELL_SIZE // 2
+        pygame.draw.circle(self.screen, (50, 120, 255), (center_x, center_y), CELL_SIZE // 3)
 
     def generate_maze(self):
-        w, h = int(self.width_entry.get()), int(self.height_entry.get())
-        self.env = MazeEnv(w, h)
+        self.env = MazeEnv(self.width, self.height)
         required_state_dim = self.env.state_dim
         if (self.agent is None) or (self.agent.state_dim != required_state_dim):
             self.agent = DQNAgent(state_dim=required_state_dim, action_dim=len(self.env.actions))
             self.agent.load()
         else:
             self.agent.boost_exploration()
-        self.draw_static_maze()
-        self.draw_agent()
-
-    def draw_static_maze(self):
-        # draw the current env grid and force a UI refresh (must run on main thread)
-        if not self.env:
-            return
-        rows, cols = int(self.env.height), int(self.env.width)
-        # set canvas size to match maze
-        self.canvas.config(width=cols * CELL_SIZE, height=rows * CELL_SIZE)
-        # remove only maze items (keep other tags like "path", "agent", etc.)
-        try:
-            self.canvas.delete("maze")
-        except Exception:
-            self.canvas.delete("all")
-        # draw cells row-major (i = row, j = col)
-        for i in range(rows):
-            for j in range(cols):
-                cell = int(self.env.board[i, j])
-                x0 = j * CELL_SIZE
-                y0 = i * CELL_SIZE
-                x1 = x0 + CELL_SIZE
-                y1 = y0 + CELL_SIZE
-                if cell == 1:
-                    color = "black"
-                elif cell == 2:
-                    color = "green"
-                elif cell == 3:
-                    color = "red"
-                else:
-                    color = "white"
-                self.canvas.create_rectangle(x0, y0, x1, y1, fill=color, outline="#ccc", tags="maze")
-        # ensure the mainloop processes pending drawing events immediately
-        try:
-            self.root.update_idletasks()
-            self.root.update()
-        except Exception:
-            # update may fail if called during teardown; ignore
-            pass
-        # optional log to console if present
-        if hasattr(self, "console") and self.console is not None:
-            try:
-                self.console.log("[INFO] Maze drawn\n")
-            except Exception:
-                pass
-
-    def draw_agent(self):
-        self.canvas.delete("agent")
-        ax, ay = self.env.agent_pos
-        x0 = ay * CELL_SIZE + 4
-        y0 = ax * CELL_SIZE + 4
-        x1 = x0 + CELL_SIZE - 8
-        y1 = y0 + CELL_SIZE - 8
-        self.canvas.create_oval(x0, y0, x1, y1, fill="blue", outline="", tags="agent")
-
-    def draw_path(self, path):
-        for px, py in path:
-            x0 = py * CELL_SIZE + 8
-            y0 = px * CELL_SIZE + 8
-            x1 = x0 + 4
-            y1 = y0 + 4
-            self.canvas.create_oval(x0, y0, x1, y1, fill="cyan", outline="")
-
-
-    def on_close(self):
-        """Signal threads to stop, wait briefly, then destroy the UI."""
-        # set stop flag so training loop can exit
-        self.stop_event.set()
-        # if there's a training thread, wait a short while for it to finish
-        if getattr(self, "training_thread", None) and self.training_thread.is_alive():
-            try:
-                self.training_thread.join(timeout=1.0)
-            except Exception:
-                pass
-        try:
-            self.root.destroy()
-        except Exception:
-            pass
+        self.set_status(f"Generated new maze {self.width}x{self.height}. Press T to train.")
 
     def start_training_thread(self):
         if self.training_thread and self.training_thread.is_alive():
             return
-        # clear any previous stop request and start daemon thread
         self.stop_event.clear()
         self.training_thread = Thread(target=self.train_on_multiple_mazes, daemon=True)
         self.training_thread.start()
+        self.set_status("Training started (background).")
 
     def train_on_multiple_mazes(self, mazes=100, episodes_per_maze=100):
         for maze_index in range(mazes):
-            # allow graceful exit requested from UI
             if self.stop_event.is_set():
                 return
-            # create valid maze on worker thread
             while True:
-                self.env = MazeEnv(width=int(self.width_entry.get()), height=int(self.height_entry.get()))
+                self.env = MazeEnv(self.width, self.height)
                 if self.env.start and self.env.goal and self.env.start != self.env.goal:
                     break
 
             self.training_stats["mazes"] += 1
-
-            # compute required state dim (meta + stacked maps)
             required_state_dim = self.env.state_dim
-            # Always ensure agent exists and uses required_state_dim before any train() calls.
             if (self.agent is None) or (self.agent.state_dim != required_state_dim):
                 self.agent = DQNAgent(state_dim=required_state_dim, action_dim=len(self.env.actions))
-                # load will attempt exact or partial load but will NOT change state_dim
                 self.agent.load()
             else:
                 self.agent.boost_exploration()
 
-            # whenever a new maze is created (even if the dimensions match), redraw the UI
             self.env.agent_pos = self.env.start
-            self._ui(self.canvas.delete, "all")
-            self._ui(self.draw_static_maze)
-            self._ui(self.draw_agent)
+            self.set_status(f"Maze {maze_index+1}/{mazes} generated. Training...")
 
-            # notify UI that a new maze was generated / drawn
-            # update stats label and optionally log to console widget if present
-            # show initial stats for the new maze (no episode yet)
-            init_white = self.env.white_distance if getattr(self.env, "white_distance", None) is not None else "N/A"
-            if hasattr(self, "console") and self.console is not None:
-                self._ui(self.console.log, f"[INFO] Generated maze {maze_index+1}/{mazes} (white_dist={init_white})")
-            
-            solved = False
+            maze_solved_any = False
+            solved_streak = 0
             episode_rewards = []
+            best_reward = -float("inf")
+            stagnation_counter = 0
+            stagnation_patience = 15
+            exit_reason = ""
+
             for ep in range(episodes_per_maze):
-                # allow graceful exit requested from UI
-                self.env.reset()
                 if self.stop_event.is_set():
                     return
+                self.env.reset()
                 state = self.env._get_state()
                 total_reward = 0.0
                 estimated = self.env.white_distance if self.env.white_distance is not None else (self.env.width * self.env.height)
                 max_steps = max(int(estimated * 3), self.env.width * self.env.height // 2, self.env.width + self.env.height)
+                solved_this_episode = False
                 for step in range(max_steps):
                     if self.stop_event.is_set():
                         return
@@ -356,60 +362,51 @@ class MazeApp:
                     self.agent.train()
                     state = next_state
                     total_reward += reward
-                    # only update agent drawing (fast) on main thread
-                    self._ui(self.draw_agent)
                     if done:
-                        solved = True
+                        solved_this_episode = True
                         break
-                    self._ui(self.stats.config, {"text": f"Maze {maze_index+1}/{mazes} generated | WhiteDist: {init_white} | Eps: {self.agent.epsilon:.3f} | Reward: {total_reward:.2f}"})
-                    time.sleep(0.01)  # slight delay to visualize agent movement
+                    time.sleep(0.005)
+
                 episode_rewards.append(total_reward)
                 self.training_stats["episodes"] += 1
                 self.agent.update_target()
-                
-                # update stats label on main thread
-                # compute white distance display (fresh value)
-                current_white = self.env.white_distance if getattr(self.env, "white_distance", None) is not None else self.env.compute_white_distance()
-                white_disp = current_white if current_white is not None else "inf"
+
                 success_rate = self.training_stats["solved"] / max(1, self.training_stats["mazes"])
-                # update stats label on main thread with full info
-                self._ui(self.stats.config, {"text":
-                    f"Maze {maze_index+1}/{mazes} | Ep {ep+1}/{episodes_per_maze} | Reward: {total_reward:.2f} | Eps: {self.agent.epsilon:.3f} | WhiteDist: {white_disp} | SR: {success_rate:.2f}"
-                })
-                
-                if solved:
-                    # save and show final path on UI thread
-                    self.training_stats["solved"] += 1
-                    self.agent.save()
-                    self._ui(self.show_path)
-                    break
+                rolling_reward = float(np.mean(episode_rewards[-5:])) if episode_rewards else 0.0
+                self.set_status(
+                    f"Maze {maze_index+1}/{mazes} | Ep {ep+1}/{episodes_per_maze} | Reward {total_reward:.2f} | Avg5 {rolling_reward:.2f} | SR {success_rate:.2f}"
+                )
+
+                if solved_this_episode:
+                    solved_streak += 1
+                    if not maze_solved_any:
+                        maze_solved_any = True
+                        self.training_stats["solved"] += 1
+                    if solved_streak >= 5:
+                        exit_reason = "5 consecutive solves"
+                        break
+                else:
+                    solved_streak = 0
+
+                if total_reward > best_reward + 0.1:
+                    best_reward = total_reward
+                    stagnation_counter = 0
+                else:
+                    stagnation_counter += 1
+                    if stagnation_counter >= stagnation_patience:
+                        exit_reason = f"plateau ({stagnation_patience} eps without gain)"
+                        break
+
             average_reward = float(np.mean(episode_rewards)) if episode_rewards else 0.0
-            result = "solved" if solved else "unsolved"
-            summary_text = f"Maze {maze_index+1}/{mazes} {result} | avg reward {average_reward:.2f}"
-            if hasattr(self, "console") and self.console is not None:
-                self._ui(self.console.log, f"[INFO] {summary_text}")
-            else:
-                print(f"[INFO] {summary_text}")
+            result = "solved" if maze_solved_any else "unsolved"
+            if not exit_reason:
+                exit_reason = "max episodes reached"
+            summary_text = f"Maze {maze_index+1}/{mazes} {result} | avg reward {average_reward:.2f} | streak {solved_streak} | {exit_reason}"
+            print(f"[INFO] {summary_text}")
+            self.set_status(summary_text)
             self.agent.save()
-        
-
-
-            
-
-
-
-    def show_path(self):
-        if not self.env or not self.agent:
-            return
-        path = self.env.get_path(self.agent)
-        self.draw_path(path)
-
-      
 
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = MazeApp(root)
-    root.mainloop()
-
-
+    game = MazeGame()
+    game.run()
