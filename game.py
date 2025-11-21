@@ -1,7 +1,4 @@
-from concurrent.futures import thread
-import board_gen 
 from board_gen import *
-import random
 import tkinter as tk
 from tkinter import ttk
 import numpy as np
@@ -17,36 +14,69 @@ class MazeEnv:
     def __init__(self, width, height):
         self.width, self.height = width, height
         self.actions = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+        self.board = None
+        self.start = None
+        self.goal = None
         self.white_distance = None
-        self.reset()
+        self.last_distance = None
+        self.prev_move = (0, 0)
+        self.reset(regenerate=True)
 
-    def reset(self):
-        b = Board(sizeX=self.height, sizeY=self.width)
-        self.board = np.array(b.board, dtype=np.int8)
-        s = np.argwhere(self.board == 2)
-        g = np.argwhere(self.board == 3)
-        if len(s) == 0 or len(g) == 0:
-            return self.reset()
-        self.start = tuple(s[0])
-        self.goal = tuple(g[0])
+    def _generate_board(self):
+        while True:
+            b = Board(sizeX=self.height, sizeY=self.width)
+            board = np.array(b.board, dtype=np.int8)
+            s = np.argwhere(board == 2)
+            g = np.argwhere(board == 3)
+            if len(s) == 0 or len(g) == 0:
+                continue
+            start = tuple(s[0])
+            goal = tuple(g[0])
+            if start == goal:
+                continue
+            self.board = board
+            self.start = start
+            self.goal = goal
+            break
+
+    def _reset_agent_state(self):
         self.agent_pos = self.start
-        # compute white distance at reset so callers can read it
+        self.prev_move = (0, 0)
         self.white_distance = self.compute_white_distance()
+        max_dist = self.width * self.height
+        self.last_distance = self.white_distance if self.white_distance is not None else max_dist
+
+    def reset(self, regenerate=False):
+        if regenerate or self.board is None:
+            self._generate_board()
+        self._reset_agent_state()
         return self._get_state()
 
     def step(self, action):
         dx, dy = self.actions[action]
         x, y = self.agent_pos
         nx, ny = x + dx, y + dy
+        invalid_penalty = -0.2
         if not (0 <= nx < self.height and 0 <= ny < self.width):
-            return self._get_state(), -0.05, False
+            self.prev_move = (0, 0)
+            return self._get_state(), invalid_penalty, False
         if int(self.board[nx, ny]) == 1:
-            return self._get_state(), -0.1, False
+            self.prev_move = (0, 0)
+            return self._get_state(), invalid_penalty, False
         self.agent_pos = (nx, ny)
-        reward = 1.0 if self.agent_pos == self.goal else -0.01
+        self.prev_move = (dx, dy)
+        previous = self.last_distance if self.last_distance is not None else (self.width * self.height)
         # update white_distance when agent moves (optional small cost to recompute is fine)
         self.white_distance = self.compute_white_distance()
-        return self._get_state(), reward, self.agent_pos == self.goal
+        current = self.white_distance if self.white_distance is not None else (self.width * self.height)
+        progress = previous - current
+        # shaped reward encourages moving closer to goal, mild penalty for wandering
+        reward = -0.02 + 0.1 * np.clip(progress, -1.0, 1.0)
+        self.last_distance = current
+        done = self.agent_pos == self.goal
+        if done:
+            reward = 5.0
+        return self._get_state(), reward, done
 
     def compute_white_distance(self):
         """Return shortest path length in white/free cells from agent (or start) to goal using BFS.
@@ -72,8 +102,7 @@ class MazeEnv:
 
     def _get_state(self):
         """
-        State = [ax_norm, ay_norm, gx_norm, gy_norm, norm_shortest_white_distance] + flattened wall_map
-        shortest_white_distance = shortest path length from agent to goal using only non-wall cells (BFS)
+        State = meta (agent/goal/prev move info) + flattened wall, agent, goal maps.
         """
         ax, ay = self.agent_pos
         gx, gy = self.goal
@@ -82,17 +111,42 @@ class MazeEnv:
         if shortest is None:
             shortest = self.width * self.height  # sentinel large
         norm_dist = float(shortest) / float(self.width * self.height)
+        norm_last = float(self.last_distance if self.last_distance is not None else self.width * self.height) / float(self.width * self.height)
+        prev_dx, prev_dy = self.prev_move
 
         meta = np.array([
             ax / float(self.height),
             ay / float(self.width),
             gx / float(self.height),
             gy / float(self.width),
-            norm_dist
+            norm_dist,
+            norm_last,
+            prev_dx,
+            prev_dy
         ], dtype=np.float32)
 
         wall_map = (self.board == 1).astype(np.float32).ravel()
-        return np.concatenate([meta, wall_map]).astype(np.float32)
+        agent_map = np.zeros_like(self.board, dtype=np.float32)
+        agent_map[ax, ay] = 1.0
+        goal_map = np.zeros_like(self.board, dtype=np.float32)
+        goal_map[gx, gy] = 1.0
+        return np.concatenate([meta, wall_map, agent_map.ravel(), goal_map.ravel()]).astype(np.float32)
+
+    @property
+    def state_dim(self):
+        # meta (8 values) + three flattened maps (wall/agent/goal)
+        return int(8 + 3 * self.width * self.height)
+
+    def get_valid_actions(self):
+        valids = []
+        x, y = self.agent_pos
+        for dx, dy in self.actions:
+            nx, ny = x + dx, y + dy
+            if 0 <= nx < self.height and 0 <= ny < self.width and int(self.board[nx, ny]) != 1:
+                valids.append(True)
+            else:
+                valids.append(False)
+        return np.array(valids, dtype=bool)
 
 
     def get_path(self, agent):
@@ -100,7 +154,7 @@ class MazeEnv:
         path = [self.start]
         for _ in range(500):
             state = self._get_state()
-            action = agent.act(state, greedy=True)
+            action = agent.act(state, greedy=True, valid_actions=self.get_valid_actions())
             _, _, done = self.step(action)
             path.append(self.agent_pos)
             if done: break
@@ -126,6 +180,7 @@ class MazeApp:
         # graceful shutdown support for training thread
         self.stop_event = threading.Event()
         self.training_thread = None
+        self.training_stats = {"mazes": 0, "solved": 0, "episodes": 0}
         # ensure window close goes through our handler so background threads stop
         try:
             self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -151,9 +206,12 @@ class MazeApp:
     def generate_maze(self):
         w, h = int(self.width_entry.get()), int(self.height_entry.get())
         self.env = MazeEnv(w, h)
-        if not self.agent:
-            self.agent = DQNAgent()
+        required_state_dim = self.env.state_dim
+        if (self.agent is None) or (self.agent.state_dim != required_state_dim):
+            self.agent = DQNAgent(state_dim=required_state_dim, action_dim=len(self.env.actions))
             self.agent.load()
+        else:
+            self.agent.boost_exploration()
         self.draw_static_maze()
         self.draw_agent()
 
@@ -252,28 +310,33 @@ class MazeApp:
                 if self.env.start and self.env.goal and self.env.start != self.env.goal:
                     break
 
-            # compute required state dim (5 metadata + width*height flattened wall map)
-            required_state_dim = self.env.width * self.env.height + 5
+            self.training_stats["mazes"] += 1
+
+            # compute required state dim (meta + stacked maps)
+            required_state_dim = self.env.state_dim
             # Always ensure agent exists and uses required_state_dim before any train() calls.
             if (self.agent is None) or (self.agent.state_dim != required_state_dim):
-                self.agent = DQNAgent(state_dim=required_state_dim, action_dim=4)
+                self.agent = DQNAgent(state_dim=required_state_dim, action_dim=len(self.env.actions))
                 # load will attempt exact or partial load but will NOT change state_dim
                 self.agent.load()
-                # schedule UI updates on main thread
-                self._ui(self.canvas.delete, "all")
-                self._ui(self.draw_static_maze)
-                self.env.agent_pos = self.env.start
-                self._ui(self.draw_agent)
+            else:
+                self.agent.boost_exploration()
 
-                # notify UI that a new maze was generated / drawn
-                # update stats label and optionally log to console widget if present
-                # show initial stats for the new maze (no episode yet)
-                init_white = self.env.white_distance if getattr(self.env, "white_distance", None) is not None else "N/A"
-                self._ui(self.stats.config, {"text": f"Maze {maze_index+1}/{mazes} generated | WhiteDist: {init_white} | Eps: {self.agent.epsilon:.3f}"})
-                if hasattr(self, "console") and self.console is not None:
-                    self._ui(self.console.log, f"[INFO] Generated maze {maze_index+1}/{mazes} (white_dist={init_white})")
+            # whenever a new maze is created (even if the dimensions match), redraw the UI
+            self.env.agent_pos = self.env.start
+            self._ui(self.canvas.delete, "all")
+            self._ui(self.draw_static_maze)
+            self._ui(self.draw_agent)
+
+            # notify UI that a new maze was generated / drawn
+            # update stats label and optionally log to console widget if present
+            # show initial stats for the new maze (no episode yet)
+            init_white = self.env.white_distance if getattr(self.env, "white_distance", None) is not None else "N/A"
+            if hasattr(self, "console") and self.console is not None:
+                self._ui(self.console.log, f"[INFO] Generated maze {maze_index+1}/{mazes} (white_dist={init_white})")
             
             solved = False
+            episode_rewards = []
             for ep in range(episodes_per_maze):
                 # allow graceful exit requested from UI
                 self.env.reset()
@@ -281,10 +344,13 @@ class MazeApp:
                     return
                 state = self.env._get_state()
                 total_reward = 0.0
-                for step in range((self.env.width * self.env.height)//2):
+                estimated = self.env.white_distance if self.env.white_distance is not None else (self.env.width * self.env.height)
+                max_steps = max(int(estimated * 3), self.env.width * self.env.height // 2, self.env.width + self.env.height)
+                for step in range(max_steps):
                     if self.stop_event.is_set():
                         return
-                    action = self.agent.act(state)
+                    valid_actions = self.env.get_valid_actions()
+                    action = self.agent.act(state, valid_actions=valid_actions)
                     next_state, reward, done = self.env.step(action)
                     self.agent.remember(state, action, reward, next_state, done)
                     self.agent.train()
@@ -295,30 +361,36 @@ class MazeApp:
                     if done:
                         solved = True
                         break
+                    self._ui(self.stats.config, {"text": f"Maze {maze_index+1}/{mazes} generated | WhiteDist: {init_white} | Eps: {self.agent.epsilon:.3f} | Reward: {total_reward:.2f}"})
                     time.sleep(0.01)  # slight delay to visualize agent movement
+                episode_rewards.append(total_reward)
+                self.training_stats["episodes"] += 1
                 self.agent.update_target()
                 
                 # update stats label on main thread
                 # compute white distance display (fresh value)
                 current_white = self.env.white_distance if getattr(self.env, "white_distance", None) is not None else self.env.compute_white_distance()
                 white_disp = current_white if current_white is not None else "inf"
+                success_rate = self.training_stats["solved"] / max(1, self.training_stats["mazes"])
                 # update stats label on main thread with full info
                 self._ui(self.stats.config, {"text":
-                    f"Maze {maze_index+1}/{mazes} | Ep {ep+1}/{episodes_per_maze} | Reward: {total_reward:.2f} | Eps: {self.agent.epsilon:.3f} | WhiteDist: {white_disp}"
+                    f"Maze {maze_index+1}/{mazes} | Ep {ep+1}/{episodes_per_maze} | Reward: {total_reward:.2f} | Eps: {self.agent.epsilon:.3f} | WhiteDist: {white_disp} | SR: {success_rate:.2f}"
                 })
                 
-
                 if solved:
                     # save and show final path on UI thread
+                    self.training_stats["solved"] += 1
                     self.agent.save()
                     self._ui(self.show_path)
                     break
-                if solved:
-                    self.agent.save()
-                    self.show_path()
-                else:
-                    print(f"[INFO] Maze {maze_index+1} skipped (unsolved)")
-                self.agent.save()
+            average_reward = float(np.mean(episode_rewards)) if episode_rewards else 0.0
+            result = "solved" if solved else "unsolved"
+            summary_text = f"Maze {maze_index+1}/{mazes} {result} | avg reward {average_reward:.2f}"
+            if hasattr(self, "console") and self.console is not None:
+                self._ui(self.console.log, f"[INFO] {summary_text}")
+            else:
+                print(f"[INFO] {summary_text}")
+            self.agent.save()
         
 
 
@@ -327,8 +399,10 @@ class MazeApp:
 
 
     def show_path(self):
+        if not self.env or not self.agent:
+            return
         path = self.env.get_path(self.agent)
-        self.draw_static_maze(path)
+        self.draw_path(path)
 
       
 

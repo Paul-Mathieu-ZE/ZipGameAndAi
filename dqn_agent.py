@@ -41,13 +41,24 @@ class DQNAgent:
         self.target.load_state_dict(self.model.state_dict())
         self.optimizer = optim.Adam(self.model.parameters(), lr=1e-3)
 
-    def act(self, state, greedy=False):
+    def act(self, state, greedy=False, valid_actions=None):
+        if valid_actions is not None and not valid_actions.any():
+            valid_actions = None
         if not greedy and random.random() < self.epsilon:
+            if valid_actions is not None:
+                choices = np.flatnonzero(valid_actions)
+                return int(np.random.choice(choices))
             return random.randint(0, self.action_dim - 1)
         with torch.no_grad():
             state_tensor = torch.tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
             q = self.model(state_tensor)
-            return int(torch.argmax(q, dim=1).item())
+            q_values = q.squeeze(0)
+            if valid_actions is not None:
+                mask = torch.tensor(valid_actions, dtype=torch.bool, device=self.device)
+                masked_q = q_values.clone()
+                masked_q[~mask] = -1e9
+                return int(torch.argmax(masked_q).item())
+            return int(torch.argmax(q_values).item())
 
     def remember(self, s, a, r, s_, done):
         self.memory.append((np.array(s, dtype=np.float32), int(a), float(r), np.array(s_, dtype=np.float32), bool(done)))
@@ -76,6 +87,11 @@ class DQNAgent:
 
     def update_target(self):
         self.target.load_state_dict(self.model.state_dict())
+
+    def boost_exploration(self, epsilon_floor=0.3):
+        """Increase epsilon when switching to a fresh maze to promote exploration."""
+        epsilon_floor = min(max(epsilon_floor, self.epsilon_min), 1.0)
+        self.epsilon = max(self.epsilon, epsilon_floor)
 
     def save(self, path="dqn_model.pth"):
         # save CPU tensors for portability
